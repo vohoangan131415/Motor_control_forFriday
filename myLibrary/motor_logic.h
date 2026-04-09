@@ -10,18 +10,12 @@ typedef enum {
     MOTOR_STOP, 
 		
 } MOTOR_STATUS;
-typedef enum{
-		MOTOR_MANUAL, 
-		MOTOR_AUTO,
-}MOTOR_MODE;
+
 
 // Khai báo extern d? main.c và các file khác có th? dùng chung
 extern volatile uint8_t current_motor_status;
-extern volatile uint8_t current_motor_mode;
 extern uint8_t direction ;
 extern uint16_t current_speed;
-
 void Motor_handle(void);
-void Motor_Control(void);
 
 #endif

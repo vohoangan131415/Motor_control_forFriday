@@ -29,5 +29,10 @@ motor_control\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_flash_ex
 motor_control\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_pwr.h
 motor_control\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_tim.h
 motor_control\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_tim_ex.h
-motor_control\main.o: ..\myLibrary\motor.h
-motor_control\main.o: ..\myLibrary\motor_logic.h
+motor_control\main.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_uart.h
+motor_control\main.o: ../myLibrary/motor.h
+motor_control\main.o: ../myLibrary/motor_logic.h
+motor_control\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdio.h
+motor_control\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdlib.h
+motor_control\main.o: ../myLibrary/Encoder.h
+motor_control\main.o: ../myLibrary/PID.h

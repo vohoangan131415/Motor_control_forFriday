@@ -11,5 +11,4 @@ void Init_Motor(void);
 void Motor_Forward(uint16_t speed);
 void Motor_Backward(uint16_t speed);
 void Motor_Stop(void);
-
 #endif

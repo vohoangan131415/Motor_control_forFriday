@@ -18,9 +18,12 @@
 "motor_control\stm32f1xx_hal_exti.o"
 "motor_control\stm32f1xx_hal_tim.o"
 "motor_control\stm32f1xx_hal_tim_ex.o"
+"motor_control\stm32f1xx_hal_uart.o"
 "motor_control\system_stm32f1xx.o"
 "motor_control\motor.o"
 "motor_control\motor_logic.o"
+"motor_control\encoder.o"
+"motor_control\pid.o"
 --strict --scatter "motor_control\motor_control.sct"
 --summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols
 --info sizes --info totals --info unused --info veneers
