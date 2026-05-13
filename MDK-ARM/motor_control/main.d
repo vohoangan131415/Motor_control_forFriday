@@ -36,3 +36,4 @@ motor_control\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdio.h
 motor_control\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdlib.h
 motor_control\main.o: ../myLibrary/Encoder.h
 motor_control\main.o: ../myLibrary/PID.h
+motor_control\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\string.h

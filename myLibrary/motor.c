@@ -23,4 +23,5 @@ void Motor_Backward(uint16_t speed) {
 void Motor_Stop() {
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+		HAL_GPIO_WritePin(GPIOA, R_EN | L_EN, GPIO_PIN_RESET);
 }

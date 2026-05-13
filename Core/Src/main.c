@@ -28,6 +28,7 @@
 #include "stdlib.h"
 #include "Encoder.h"
 #include "PID.h"
+#include "string.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -76,6 +77,7 @@ static void MX_ADC2_Init(void);
 #define ADC_MAX         4095.0f // Độ phân giải 12-bit
 #define R_SHUNT         1000.0f // Điện trở trên chân IS (thường là 1k Ohm = 1000)
 #define K_ILIS          1950.0f // Hệ số của chip BTS7960 (tra datasheet)
+#define PULSE_TO_MM_RATIO (8.0f / 422.4f)
 uint8_t direction = 1;       
 uint16_t rx_buffer[8] = {0}; 
 uint8_t rx_data;
@@ -84,7 +86,7 @@ uint16_t current_speed;
 uint8_t flag = 0;
 volatile uint8_t current_motor_status;
 //buffer
-char buffer[21]; // gửi dữ liệu lên matlab
+char buffer[60]; // gửi dữ liệu lên matlab
 char MatlabBufferEncoder[8]; // receive Encoder data from matlab
 char MatlabBufferPID1[64]; // receive PID data from matlab
 //========
@@ -100,11 +102,102 @@ uint8_t PIDinUSED = 0;
 uint8_t isPIDReceiving = 0;
 PID_typedef myPID;
 uint32_t last_send_time =0;
+uint32_t mode = 0;
+float start_pos;
 	float v_acc = 0;
 	float acc_step = 2.0f;
 	float current_vel;
            // Hệ số lọc (càng nhỏ càng mượt nhưng càng trễ)
 	static uint32_t last_pid_time = 0;
+// custom
+uint8_t isCustomReceiving = 0;
+uint8_t isPIDCustomReceiving = 0;
+// Dung bien tro de dieu chinh toc do 
+uint8_t isManual = 0;
+/// các che do hinh thang 
+typedef struct{
+	float accel_dist;
+	float maintain_dist;
+	float decel_dist;
+}Mode_Profile;
+uint8_t EnNum;
+uint8_t is_waiting = 0;
+Mode_Profile profiles[4] = {
+    {5000.0f, 2000.0f, 4000.0f}, // Mode 1: Cân bằng
+    {2000.0f, 5000.0f, 3000.0f}, // Mode 2: Mượt mà
+    {20000.0f,  2000.0f, 8000},  // Mode 3: Gắt/Nhanh
+    {0.0f, 0.0f, 0.0f}  // Mode 4: Khởi động chậm, dừng nhanh
+};
+Mode_Profile profiles_mm[4]; // Mảng này dùng để chạy thực tế
+typedef enum{
+	VELOCITY_MODE = 0,
+	POSITION_CONTROL,
+	MANUAL_MODE,
+	VELOCITY_POT, // CHANGE SETPOINT BY PO
+	ENCODER_MODE,
+	RESET_MODE,
+}PID_Mode;
+ volatile PID_Mode pid_mode;
+
+typedef enum{
+	MODE_E1,
+	MODE_E2,
+	MODE_E3,
+	MODE_E4,
+	MODE_RESET
+}Encoder_Mode;
+ volatile Encoder_Mode ModeE;
+
+void Convert_Pulse_to_MM_Profiles(Mode_Profile p_pulse[]) {
+    for(int i = 0; i < 4; i++) {
+        p_pulse[i].accel_dist    = profiles[i].accel_dist    * PULSE_TO_MM_RATIO;
+        p_pulse[i].maintain_dist = profiles[i].maintain_dist * PULSE_TO_MM_RATIO;
+        p_pulse[i].decel_dist    = profiles[i].decel_dist    * PULSE_TO_MM_RATIO;
+    }
+}
+float Encoder_mode_Handle(PID_typedef *pid, Mode_Profile p[EnNum])
+{
+		
+		pid->current_pos = Encoder_GetDistance() ; // dua ve don vi xung
+		pid->current_velocity = (pid->current_pos - pid->last_pos)/0.02f;
+		float v_max = 91; 
+		float total_pulses = p[EnNum].accel_dist + p[EnNum].maintain_dist + p[EnNum].decel_dist;
+		 
+		if(pid->current_pos < p[EnNum].accel_dist) // Accel phase 
+		{
+			pid->target_velocity = (pid->current_pos / p[EnNum].accel_dist) * 91.0f;
+			if (pid->target_velocity < 10.0f) pid->target_velocity = 10.0f; // min vel
+		}
+		else if(pid->current_pos < (p[EnNum].accel_dist + p[EnNum].maintain_dist)) // maintain phase
+		{
+			pid->target_velocity = v_max;
+		}
+		else if(pid->current_pos < total_pulses) // decel phase
+		{
+			float dist_left = total_pulses - pid->current_pos;
+			pid->target_velocity = (dist_left/ p[EnNum].decel_dist) * 91.0f;
+		}
+		output = PID_Compute(&myPID, pid->target_velocity, pid->current_velocity, 0.02f);
+		pid->last_pos = pid->current_pos;
+		if (pid->current_pos >= total_pulses) {
+				current_speed = 0;
+				current_motor_status = MOTOR_STOP;
+				return 0; // Thoát hàm luôn, không cho PID_Compute chạy nữa
+		}
+		if(output > 0)
+		{
+			 current_motor_status = MOTOR_SPEED_UP;
+			 current_speed = (uint16_t)output;
+			}
+			else
+			{
+				current_motor_status = MOTOR_SPEED_DOWN;
+				myPID.integral_Stored = 0;
+				current_speed= 0;
+		}
+}
+
+
 //Interrupt for receiving data
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -114,61 +207,145 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   if(huart->Instance == USART1)
 	{
 		flag = 1;
+		PID_Reset(&myPID);
+		
 		HAL_UART_Receive_IT(&huart1, &rx_data, 1);
 	}
 }
+volatile uint8_t limit_left = 0;
+volatile uint8_t limit_right = 0;
+void Motor_State_Control_With_Reset(uint8_t target_state, uint16_t speed) 
+{
+    static uint8_t last_state = MOTOR_STOP;
+    static uint32_t stop_time_start = 0;
 
+    // 1. Phát hiện sự kiện đảo chiều
+    if ((target_state == MOTOR_SPEED_UP && last_state == MOTOR_SPEED_DOWN) ||
+        (target_state == MOTOR_SPEED_DOWN && last_state == MOTOR_SPEED_UP)) 
+    {
+        is_waiting = 1;
+        stop_time_start = HAL_GetTick();
+        
+        PID_Reset(&myPID); // Reset I và các thông số PID
+        
+        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
+        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+    }
+
+    // 2. Chờ bằng Timer (Trạm gác nội bộ)
+    if (is_waiting) 
+    {
+        if (HAL_GetTick() - stop_time_start < 1000) // Để 10s cho Ân dễ quan sát
+        {
+            // Ép dừng và THOÁT HÀM, không cho Bước 3 chạy
+            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
+            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+            
+            // Cập nhật last_state ở đây để tránh lặp lại if ở Bước 1
+            last_state = target_state; 
+            return; 
+        }
+        else 
+        {
+            is_waiting = 0; // Hết thời gian chờ, cho phép xuống Bước 3
+        }
+    }
+
+    // 3. Thực thi điều khiển (Chỉ chạy khi ĐÃ CHỜ XONG)
+    if (target_state == MOTOR_SPEED_UP) 
+    {
+        current_motor_status = MOTOR_SPEED_UP;
+    } 
+    else if (target_state == MOTOR_SPEED_DOWN) 
+    {
+        current_motor_status = MOTOR_SPEED_DOWN;
+    }
+    else 
+    {
+        // Trường hợp Stop
+        current_motor_status = MOTOR_STOP;
+        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
+        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+    }
+
+    last_state = target_state;
+}
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    if (GPIO_Pin == GPIO_PIN_10) { // TRÁI
+        limit_left = 1;
+        Motor_Stop();	
+    }
+    else if (GPIO_Pin == GPIO_PIN_11) { // PHẢI
+        limit_right = 1;
+        Motor_Stop();
+    }
+}
+
+uint32_t last_ramp_time = 0;
 void handle_simple_command(uint8_t *command)
 {
 	switch(*command)
 			{
 				case 'V':
 					speed_mode = 1;
-				
-				case 'f': //Forward
-					current_motor_status = MOTOR_SPEED_UP;
-					
-					break;
-				case 'r': //Backward
-					current_motor_status = MOTOR_SPEED_DOWN;
-				
-					break;
+				break;
+				// Trong handle_simple_command:
+				case 'f': // Forward
+            // CHỈ cho phép cập nhật hướng nếu đang ở MANUAL_MODE
+            if(pid_mode == MANUAL_MODE) {
+                current_motor_status = MOTOR_SPEED_UP;
+            }
+            break;
+
+        case 'r': // Backward
+            if(pid_mode == MANUAL_MODE) {
+                current_motor_status = MOTOR_SPEED_DOWN;
+            }
+            break;
+		
 				case 's': // Stop
           current_motor_status = MOTOR_STOP;
 					isMoving = 0;
+					
+					v_acc =0;
+				isManual =0;
 					break;
 				case 'h':  //Home
 						//current_speed = 30;
-						target_mm = 0;
-						isMoving = 1;      // PHẢI CÓ DÒNG NÀY để kích hoạt bộ điều khiển
-						isEncoderReceiving = 0;
-				
-					PIDinUSED =1;
+						myPID.target_mm = 0;	
+						myPID.integral_Stored  = 0;
             break;
-				case 'g': // Go
-							isEncoderReceiving = 1;
-							rx_index = 0;
-							PIDinUSED =1;
-				
-							//current_speed = 30;
-						break;
 				case 'z': //Set Zero
-						Encoder_SetZero();
+						current_motor_status = MOTOR_STOP;
+						Encoder_SetZero(&myPID);	
 						break;
 				case 'P':	
 					isPIDReceiving = 1;
+					//PID_Reset(&myPID);
+					//myPID.integral_Stored = 0;
 					//rx_index = 0;
 					break;
-				case 'm':
-						PIDinUSED = 0;        
-						isMoving = 0;         // Dừng motor cho an toàn khi chuyển chế độ
-						current_motor_status = MOTOR_STOP;
-						HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, 0);
-						// Reset các biến tích phân của PID để lần sau bật lại không bị giật
-						myPID.integral_Stored = 0;
-						myPID.previous_error = 0;
-						isPIDReceiving =0;
-					break;
+				case 'p':
+					pid_mode = VELOCITY_POT;
+				isPIDReceiving = 1;
+				break;
+				case 'J': 
+					pid_mode = RESET_MODE;
+					
+				
+				break;
+//				case 'm':
+//						//PIDinUSED = 0;        
+//						//isMoving = 0;         // Dừng motor cho an toàn khi chuyển chế độ
+//						//current_motor_status = MOTOR_STOP;
+//						HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, 0);
+//						// Reset các biến tích phân của PID để lần sau bật lại không bị giật
+//						//myPID.integral_Stored = 0;
+//						//myPID.previous_error = 0;
+//						isPIDReceiving =0;
+//				
+//					isManual =1;
+//					break;
 				case 'l':
 						HAL_GPIO_WritePin(GPIOA, R_EN | L_EN, GPIO_PIN_RESET); 
             
@@ -178,91 +355,100 @@ void handle_simple_command(uint8_t *command)
             // 3. Kéo chân Enable lên HIGH để kích hoạt lại Driver [cite: 608]
             HAL_GPIO_WritePin(GPIOA, R_EN | L_EN, GPIO_PIN_SET);
 					break;
-					
+				case 'e': 
+					pid_mode = ENCODER_MODE;
+				Convert_Pulse_to_MM_Profiles(profiles_mm);
+					break;
+				case 'b':
+					pid_mode = VELOCITY_MODE;
+					PID_Reset(&myPID);
+				break;
+				case 'a':
+						pid_mode = POSITION_CONTROL;
+					PID_Reset(&myPID);
+					break;
+				case 'c':
+						pid_mode = MANUAL_MODE;
+					PID_Reset(&myPID);
+				break;
+				case 'g':
+					ModeE = MODE_E1;
+					myPID.integral_Stored = 0;
+				break;
+				case 'x':
+					ModeE = MODE_E2;
+					myPID.integral_Stored = 0;
+					Encoder_SetZero(&myPID); // Đưa xung về 0 trước khi chạy
+					PID_Reset(&myPID);
+					pid_mode = ENCODER_MODE;
+				break;
+				case 'v':
+					ModeE = MODE_E3;
+					Encoder_SetZero(&myPID); // Đưa xung về 0 trước khi chạy
+					PID_Reset(&myPID);
+					pid_mode = ENCODER_MODE;
+					myPID.integral_Stored = 0;
+				break;
+				case 'n':
+					ModeE = MODE_E4;
+					Encoder_SetZero(&myPID); // Đưa xung về 0 trước khi chạy
+					PID_Reset(&myPID);
+					pid_mode = ENCODER_MODE;
+					myPID.integral_Stored = 0;
+				break;
+				case 'j': 
+					ModeE = MODE_RESET;
+					myPID.integral_Stored = 0;
+					Encoder_SetZero(&myPID); // Đưa xung về 0 trước khi chạy
+					PID_Reset(&myPID);
+					pid_mode = ENCODER_MODE;
+					myPID.current_pos = 0;
+					myPID.last_pos = 0;
+				case 'C':
+					isCustomReceiving = 1;  
+				break;
+				case 'u':
+					isPIDCustomReceiving = 1;
+				break;
 			}
 }
-//uint16_t ADC_Value[2];
-//uint16_t current_Threshold = 200; //mA
-//uint8_t isSafetoReverse = 0;
-//uint16_t L_ISValue = 0;
-//uint16_t R_ISValue = 0;
-//// Cap nhat current feedback 
-float current_L = 0, current_R = 0;
-float total_current = 0;
-float R_Ampe = 0;
-float L_Ampe = 0;
-uint32_t raw_L;
-uint32_t raw_R;
-// Hàm tính dòng điện từ giá trị ADC Raw dựa trên thông số phần cứng
-float Convert_ADC_to_Amper(uint32_t adc_raw) {
-    // 1. Tính điện áp thực tế tại chân IS của STM32 (V)
-    // Công thức: (Giá trị ADC / 4095) * 3.3V
-    float V_is = (adc_raw * VREF) / ADC_MAX;
-    
-    // 2. Tính dòng điện chạy ra từ chân IS của Driver (I_is)
-    // Theo định luật Ohm: I = U / R. R_SHUNT thường là 1k (1000 Ohm)
-    float I_is = V_is / R_SHUNT;
-    
-    // 3. Quy đổi ra dòng điện thực tế chạy qua Motor (I_motor)
-    // Dựa vào hệ số K_ILIS của chip (BTS7960 thường là 1950)
-    float I_motor = I_is * K_ILIS;
-    
-    return I_motor;
-}
-float current_obs = 0; // Biến dòng điện đang quan sát
-#define SAFE_LIMIT 0.3f // Ngưỡng an toàn (Ampe)
 
-// Hàm này là "chìa khóa" để đổi kênh ADC linh hoạt
-uint32_t ADC_Read_Manual(uint32_t channel) {
-    ADC_ChannelConfTypeDef sConfig = {0};
+/**
+ * @brief  Hàm đọc dòng điện thực tế của Motor từ chân PA6
+ * @param  hadc_ptr: Con trỏ tới bộ ADC đang dùng (ví dụ &hadc1)
+ * @retval Giá trị dòng điện đơn vị Amper (float)
+ */
+float RAW = 0;
+uint32_t adc_raw = 0;
+float Get_Motor_Current(ADC_HandleTypeDef *hadc_ptr) {
+    uint32_t adc_val = 0;
+    float voltage = 0.0f;
+    float current_A = 0.0f;
+
+    // 1. Bắt đầu chuyển đổi ADC
+    HAL_ADC_Start(hadc_ptr);
     
-    // BƯỚC 1: Xóa cấu hình cũ, ép ADC2 nhìn vào kênh mới (Channel 6 hoặc 7)
-    sConfig.Channel = channel;
-    sConfig.Rank = 1; // Luôn dùng Rank 1 vì mình đã tắt Scan Mode
-    sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
-    
-    // Lệnh này ghi đè vào thanh ghi cấu hình của ADC
-    HAL_ADC_ConfigChannel(&hadc2, &sConfig); 
-    
-    // BƯỚC 2: Ra lệnh cho ADC bắt đầu đo kênh vừa cấu hình
-    HAL_ADC_Start(&hadc2);
-    
-    // BƯỚC 3: Đợi đo xong (Polling)
-    if (HAL_ADC_PollForConversion(&hadc2, 10) == HAL_OK) {
-        uint32_t val = HAL_ADC_GetValue(&hadc2);
-        HAL_ADC_Stop(&hadc2);
-        return val;
+    // 2. Chờ ADC chuyển đổi xong (timeout 10ms)
+    if (HAL_ADC_PollForConversion(hadc_ptr, 10) == HAL_OK) {
+        adc_val = HAL_ADC_GetValue(hadc_ptr);
+        
+        // 3. Công thức quy đổi:
+        // (adc_val / 4095.0f) * 3.3f  --> Đổi ra Volt
+        // Volt / 1000.0f              --> Dòng IS (vì Ân dùng trở 1k)
+        // IS * 1950.0f                --> Dòng Motor thực tế (hệ số chip)
+        
+        current_A = ((float)adc_val * 3.3f / 4095.0f / 1000.0f) * 1950.0f;
+        
+        // 4. Bộ lọc nhiễu "về 0" (Dead-band)
+        // Nếu dòng nhỏ hơn 0.05A (nhiễu nhẹ), ép về 0 cho đẹp Matlab
+        if (current_A < 0.05f) {
+            current_A = 0.0f;
+        }
     }
     
-    HAL_ADC_Stop(&hadc2);
-    return 0;
+    HAL_ADC_Stop(hadc_ptr);
+    return current_A;
 }
-
-void Update_CurrentFeedback() {
-    // Dựa vào trạng thái motor để "ra lệnh" cho ADC nhìn vào đâu
-    if (current_motor_status == MOTOR_SPEED_UP) {
-        // Đang quay thuận -> Bảo ADC: "Ê, đọc chân R (CH7) cho tao"
-        uint32_t raw_R = ADC_Read_Manual(ADC_CHANNEL_7);
-        R_Ampe = Convert_ADC_to_Amper(raw_R);
-        L_Ampe = 0.0f; // Hướng nghịch chắc chắn không có dòng, ép về 0 cho sạch
-        current_obs = R_Ampe;
-    } 
-    else if (current_motor_status == MOTOR_SPEED_DOWN) {
-        // Đang quay nghịch -> Bảo ADC: "Giờ thì chuyển sang chân L (CH6) đi"
-        uint32_t raw_L = ADC_Read_Manual(ADC_CHANNEL_6);
-        L_Ampe = Convert_ADC_to_Amper(raw_L);
-        R_Ampe = 0.0f;
-        current_obs = L_Ampe;
-    }
-    else {
-        // Khi STOP: Đọc nhanh cả 2 để kiểm tra dòng rò hoặc kẹt nhẹ
-        R_Ampe = Convert_ADC_to_Amper(ADC_Read_Manual(ADC_CHANNEL_7));
-        L_Ampe = Convert_ADC_to_Amper(ADC_Read_Manual(ADC_CHANNEL_6));
-        current_obs = (R_Ampe > L_Ampe) ? R_Ampe : L_Ampe;
-    }
-}
-// Cap nhat flag de dao chieu 
-
 
 /* USER CODE BEGIN 4 */
 
@@ -307,46 +493,50 @@ int main(void)
 	// init Module
 	Init_Motor();
 	Encoder_Init(&htim4);
-	PID_Init(&myPID, myPID.Kp, myPID.Ki, myPID.Kd,1000);
+	//Calibrate_Current_System();
+	PID_Init(&myPID, myPID.Kp, myPID.Ki, myPID.Kd, 799);
 	//Start Encoder, Timer and Interrupt UART
 	HAL_UART_Receive_IT(&huart1, &rx_data, 1); 
 	HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
 	HAL_TIM_Base_Start_IT(&htim4);
+	HAL_ADC_Start(&hadc1);
+	HAL_ADC_Start(&hadc2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-
 	
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	
+		
 		if(flag)
 		{
 			// UART Handle
 			flag = 0;
 			//Encoder Mode
-			if(isEncoderReceiving)
-			{
-					if(rx_data == '\n' || rx_data == '\r')
-					{
-							MatlabBufferEncoder[rx_index] = '\0';
-							target_mm = atof(MatlabBufferEncoder);
-							isEncoderReceiving = 0;
-							isMoving = 1;
-							rx_index = 0;
-							
-							PID_Reset(&myPID);    // X�a s?ch Integral v� Error cu
-					}
-					else if (rx_index < 8) // Tránh lưu đè chữ G vào buffer
-					{
-							MatlabBufferEncoder[rx_index++] = rx_data;
-					}
-			}
+//			if(isEncoderReceiving)
+//			{
+//					if(rx_data == '\n' || rx_data == '\r')
+//					{
+//							MatlabBufferEncoder[rx_index] = '\0';
+//							target_mm = atof(MatlabBufferEncoder);
+//							isEncoderReceiving = 0;
+//							isMoving = 1;
+//							rx_index = 0;
+//							
+//							PID_Reset(&myPID);    // X�a s?ch Integral v� Error cu
+//					}
+//					else if (rx_index < 8) // Tránh lưu đè chữ G vào buffer
+//					{
+//							MatlabBufferEncoder[rx_index++] = rx_data;
+//					}
+//			}
 			//speed mode
-					else if(speed_mode == 1)
+					if(speed_mode == 1)
 					{
 						current_speed = rx_data;
 						speed_mode = 0;
@@ -354,15 +544,16 @@ int main(void)
 				// PID mode 
 					else if(isPIDReceiving)
 						{
+								
 								if(rx_data == '\n' || rx_data == '\r')
 								{
 										MatlabBufferPID1[rx_index] = '\0';
-										sscanf(MatlabBufferPID1, "%f I %f D %f S %f M %f", &myPID.Kp, &myPID.Ki, &myPID.Kd, &target_mm, &myPID.target_velocity);
+										sscanf(MatlabBufferPID1, "%f I %f D %f M %f O%f", &myPID.Kp, &myPID.Ki, &myPID.Kd, &myPID.target_velocity, &myPID.target_mm);
+									//sscanf(MatlabBufferPID1, "%f I %f D %f S %f M %f K %d", &myPID.Kp, &myPID.Ki, &myPID.Kd, &target_mm, &myPID.target_velocity, &mode);
 										isPIDReceiving = 0;
 										isMoving = 1;
 										PIDinUSED = 1;
 										rx_index = 0;
-										
 										PID_Reset(&myPID);    // X�a s?ch Integral v� Error cu
 								}
 								else if(rx_index < 40) // Tránh lưu đè chữ G vào buffer
@@ -371,79 +562,173 @@ int main(void)
 										MatlabBufferPID1[rx_index++] = rx_data;
 								}
 						}
+					else if(isCustomReceiving && ModeE == MODE_E4)
+						{
+							if(rx_data == '\n' || rx_data == '\r')
+								{
+										MatlabBufferPID1[rx_index] = '\0';
+										sscanf(MatlabBufferPID1, "%f I %f D %f A %f T %f d %f", &myPID.Kp, &myPID.Ki, &myPID.Kd, &profiles[3].accel_dist, &profiles[3].maintain_dist, &profiles[3].decel_dist);
+										Convert_Pulse_to_MM_Profiles(profiles_mm);
+									isCustomReceiving = 0;
+										rx_index = 0;
+									
+								}
+								else if(rx_index < 64) {
+										MatlabBufferPID1[rx_index++] = rx_data;
+								}
 							
-			}
+							}
+					else if(isPIDCustomReceiving)
+						{
+							if(rx_data == '\n' || rx_data == '\r')
+								{
+										MatlabBufferPID1[rx_index] = '\0';
+										sscanf(MatlabBufferPID1, "%f i %f o %f ", &myPID.Kp, &myPID.Ki, &myPID.Kd);
+										isPIDCustomReceiving = 0;
+										rx_index = 0;
+								}
+								else if(rx_index < 20) {
+										MatlabBufferPID1[rx_index++] = rx_data;
+								}
+						}
+		}
+		
 		handle_simple_command(&rx_data);
 		Encoder_Update();	
-		Motor_handle();
-    myPID.current_pos =  Encoder_GetDistance() ;
-			
-		if (HAL_GetTick() - last_pid_time >= 20) 
-    {
-			Update_CurrentFeedback();
-			last_pid_time = HAL_GetTick();
-			if(isMoving) // For Encoder without PID 
+		
+
+			if(HAL_GetTick() - last_pid_time > 20)
 			{
-				if(PIDinUSED) // PID in used
-				{
-						HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, 1);
-						float error = target_mm - myPID.current_pos;
-						current_vel = (myPID.current_pos - myPID.last_pos) / 0.02f;
-						//vel_filtered = (alpha * current_vel_raw) + (1.0f - alpha) * vel_filtered;
-						myPID.last_pos = myPID.current_pos;
-						float distance_to_go = __fabs(error);
+				
 
-						// 1. Tạo dốc vận tốc mục tiêu
-						if(v_acc < myPID.target_velocity) v_acc += acc_step; 
-
-						// 2. Hệ số phanh: Càng gần đích v_limit càng nhỏ
-						float v_limit = distance_to_go * 2.0f; // Hệ số 1.5-2.0 là vừa đẹp
-
-						// 3. Vận tốc cuối cùng không được vượt quá v_limit
-						float v_final = (v_acc < v_limit) ? v_acc : v_limit;
-
-						// 4. Chỉ dùng 1 hàm PID duy nhất điều khiển VẬN TỐC
-						float v_target = (error > 0) ? v_final : -v_final;
-						output = PID_Compute(&myPID, v_target, current_vel, 0.02f);
-						if (error > 0) {
-											//myPID.integral_Stored = 0;
-											current_motor_status = MOTOR_SPEED_UP;
-											current_speed = (uint16_t)output;
-									} else {
-											current_motor_status = MOTOR_SPEED_DOWN;
-											current_speed = (uint16_t)__fabs(output);
-									}
-							// Dừng motor nếu sai số quá nhỏ (Dead-band)
-						if (__fabs(target_mm - myPID.current_pos) < 0.1f) {
-									isMoving = 0;
-									current_motor_status = MOTOR_STOP;
-									current_speed = 0;
-									v_acc = 0;
-									PID_Reset(&myPID);
+				if(pid_mode == VELOCITY_MODE || pid_mode == VELOCITY_POT)
+					{
+						if(pid_mode == VELOCITY_POT)
+						{
+							HAL_ADC_Start(&hadc1);
+							if(HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
+								{
+										uint32_t pot_raw = HAL_ADC_GetValue(&hadc1);
+										// Quy đổi: (pot_raw / 4095) * 799
+										myPID.target_velocity = (uint16_t)((pot_raw / 4095.0f) * 91.0f);
+								}
+						}
+						myPID.current_pos =  Encoder_GetDistance() ; // lay vi tri hien tai
+						myPID.current_velocity = (myPID.current_pos - myPID.last_pos)/0.02f;
+						if(myPID.target_velocity >= 91)
+							{
+								myPID.target_velocity = 91;
 							}
+						float error_vel = myPID.target_velocity - myPID.current_velocity ;
+						output = PID_Compute(&myPID, myPID.target_velocity, myPID.current_velocity , 0.02f);
+						myPID.last_pos = myPID.current_pos;
+						if(output > 0)
+						{
+							current_motor_status = MOTOR_SPEED_UP;
+							current_speed = (uint16_t)output;
+						}
+						else
+						{
+							current_motor_status = MOTOR_STOP;
+							//myPID.integral_Stored = 0;
+							current_speed= 0;
+						}
 						
 					}
-				
-				}
-		}
-		//PID Vel first, when near the goal, PID Pos
-	//	Update_CurrentFeedback();
-    // Sending to Matlab
-		//	Update_CurrentFeedback();
-		
-		
+				else if(pid_mode == MANUAL_MODE)
+					{
+						myPID.current_pos =  Encoder_GetDistance() ;
+						HAL_ADC_Start(&hadc1); 
+						Motor_State_Control_With_Reset(current_motor_status, current_speed);
+					// Chờ cho đến khi ADC chuyển đổi xong (Timeout 10ms)
+					if(HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
+						{
+								uint32_t pot_raw = HAL_ADC_GetValue(&hadc1);
+
+								//current_motor_status = MOTOR_SPEED_UP;
+								// Quy đổi: (pot_raw / 4095) * 799
+								current_speed = (uint16_t)((pot_raw / 4095.0f) * 799.0f);
+						}
+					
+					
+
+					myPID.last_pos = myPID.current_pos;
+					}
+				else if(pid_mode == POSITION_CONTROL)
+					{
+						myPID.current_pos =  Encoder_GetDistance() ; // lay vi tri hien tai
+						myPID.current_velocity = (myPID.current_pos - myPID.last_pos)/0.02f;
+						float error_pos = myPID.target_mm - myPID.current_pos ;
+						output = PID_Compute(&myPID, myPID.target_mm , myPID.current_pos , 0.02f);
+						if(output > 0)
+						{
+							current_motor_status = MOTOR_SPEED_UP;
+							current_speed = (uint16_t)output;
+						}
+						else
+						{
+							current_motor_status = MOTOR_SPEED_DOWN;
+							current_speed= (uint16_t)__fabs(output);
+						}
+						if (__fabs(myPID.target_mm  - myPID.current_pos) < 0.5f) {
+									current_motor_status = MOTOR_STOP;
+									current_speed = 0;
+									
+							}
+						myPID.current_velocity = (myPID.current_pos - myPID.last_pos) / 0.02f;
+						myPID.last_pos = myPID.current_pos;
+						
+					}
+				else if(pid_mode == ENCODER_MODE)
+					{
+						Convert_Pulse_to_MM_Profiles(profiles_mm);
+						 if(ModeE == MODE_E1) Encoder_mode_Handle(&myPID, &profiles_mm[0]);
+						 else if (ModeE == MODE_E2) Encoder_mode_Handle(&myPID, &profiles_mm[1]);
+						 else if (ModeE == MODE_E3) Encoder_mode_Handle(&myPID, &profiles_mm[2]);
+						 else if (ModeE == MODE_E4) Encoder_mode_Handle(&myPID, &profiles_mm[3]);
+						 else if (ModeE == MODE_RESET)
+							{
+								current_motor_status = MOTOR_STOP;
+								myPID.integral_Stored = 0;
+								Encoder_SetZero(&myPID); // Đưa xung về 0 trước khi chạy
+								PID_Reset(&myPID);
+								myPID.current_velocity= 0;
+								myPID.current_pos = 0;
+								myPID.last_pos = 0;
+								myPID.target_mm =0;
+								myPID.target_velocity = 0;
+							}
+						 }
+					else if(pid_mode == RESET_MODE)
+					{
+								current_motor_status = MOTOR_STOP;
+								Encoder_SetZero(&myPID); // Đưa xung về 0 trước khi chạy
+								myPID.integral_Stored = 0;
+								myPID.current_velocity= 0;
+								PID_Reset(&myPID);
+								myPID.current_pos = 0;
+								myPID.last_pos = 0;
+								myPID.target_mm =0;
+								myPID.target_velocity = 0;
+								output = 0;
+					}
+					Motor_handle();
+				last_pid_time = HAL_GetTick();
+					}
 		if (HAL_GetTick() - last_send_time >= 100) 
 		{
 				
 				// Định dạng: V[số],E[số]\n  (Ví dụ: V150,E12.50\n)
-			int len = sprintf(buffer, "V%d E%.2f\n", current_speed  , myPID.current_pos);
-				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, len, sizeof(buffer));
+			memset(buffer, 0, sizeof(buffer));
+			int len = sprintf(buffer, "V%d E%.2f M%d S%d T%.2f Y%.2f\n", current_speed, myPID.current_pos, pid_mode, current_motor_status, myPID.target_mm, myPID.target_velocity);
+				HAL_UART_Transmit(&huart1, (uint8_t*)buffer, len, 100);
 				last_send_time = HAL_GetTick(); 
 				
 				
-		}
 		
-  }
+		}
+	}
+  
   /* USER CODE END 3 */
 }
 
@@ -529,7 +814,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_9;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -562,7 +847,7 @@ static void MX_ADC2_Init(void)
   */
   hadc2.Instance = ADC2;
   hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc2.Init.ContinuousConvMode = DISABLE;
+  hadc2.Init.ContinuousConvMode = ENABLE;
   hadc2.Init.DiscontinuousConvMode = DISABLE;
   hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
@@ -607,9 +892,9 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 71;
+  htim2.Init.Prescaler = 8;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 999;
+  htim2.Init.Period = 799;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
@@ -715,7 +1000,7 @@ static void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 9600;
+  huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -768,6 +1053,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : PB10 PB11 */
+  GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
   /*Configure GPIO pins : PB14 PB15 */
   GPIO_InitStruct.Pin = GPIO_PIN_14|GPIO_PIN_15;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -778,6 +1069,9 @@ static void MX_GPIO_Init(void)
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI2_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 

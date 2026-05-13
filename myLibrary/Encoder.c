@@ -32,11 +32,11 @@ void Encoder_Update(void) {
     current_mm = (float)total_pulses * (LEAD_SCREW_PITCH / ENCODER_CPR);
 }
 
-void Encoder_SetZero(void) {
+void Encoder_SetZero(PID_typedef *pidPointer) {
     total_pulses = 0;
     __HAL_TIM_SET_COUNTER(encoder_htim, 0);
     last_counter = 0;
-    current_mm = 0;
+    pidPointer->current_pos = 0;
 }
 
 float Encoder_GetDistance(void) {

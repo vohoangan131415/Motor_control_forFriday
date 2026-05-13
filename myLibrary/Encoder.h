@@ -2,7 +2,7 @@
 #define __ENCODER_H
 
 #include "main.h"
-
+#include "PID.h"
 // Thông số cơ khí của Ân
 #define LEAD_SCREW_PITCH  8.0f    // 8mm per revolution
 #define ENCODER_CPR       422.4f  // Counts per revolution
@@ -10,7 +10,7 @@
 // Khai báo các hàm quản lý Encoder
 void Encoder_Init(TIM_HandleTypeDef *htim);
 void Encoder_Update(void);
-void Encoder_SetZero(void);
+void Encoder_SetZero(PID_typedef *pidPointer);
 
 // Các hàm lấy giá trị (Getter)
 float Encoder_GetDistance(void);
