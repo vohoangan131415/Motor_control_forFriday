@@ -312,8 +312,9 @@ void handle_simple_command(uint8_t *command)
 					break;
 				case 'h':  //Home
 						//current_speed = 30;
-						myPID.target_mm = 0;	
-						myPID.integral_Stored  = 0;
+						pid_mode = POSITION_CONTROL; // Ép hệ thống chuyển sang điều khiển vị trí
+						myPID.target_mm = 0;         // Đặt đích đến là gốc 0     
+						//myPID.integral_Stored  = 0;
             break;
 				case 'z': //Set Zero
 						current_motor_status = MOTOR_STOP;

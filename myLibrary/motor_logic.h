@@ -6,7 +6,7 @@ extern TIM_HandleTypeDef htim2; // L?y timer t? main.c
 typedef enum {
     MOTOR_NONE = 0,
     MOTOR_DIRECTION_CHANGE,
-    MOTOR_SPEED_UP,
+    MOTOR_SPEED_UP, 
     MOTOR_SPEED_DOWN,
     MOTOR_STOP, 
 		
